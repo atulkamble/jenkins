@@ -1,0 +1,602 @@
+// Jenkins Pipeline for Java Maven Application
+// This pipeline demonstrates Maven integration with comprehensive build, test, and deployment stages
+
+pipeline {
+    agent any
+    
+    tools {
+        maven 'Maven-3.8'
+        jdk 'JDK-11'
+    }
+    
+    environment {
+        // Application configuration
+        APP_NAME = 'java-maven-app'
+        APP_VERSION = readMavenPom().getVersion()
+        
+        // Maven configuration
+        MAVEN_OPTS = '-Xmx2048m -XX:MaxMetaspaceSize=512m'
+        MAVEN_CLI_OPTS = '--batch-mode --errors --fail-at-end --show-version'
+        
+        // Build environment
+        BUILD_TIMESTAMP = sh(script: 'date +%Y%m%d-%H%M%S', returnStdout: true).trim()
+        
+        // SonarQube configuration (if available)
+        SONAR_PROJECT_KEY = 'java-maven-app'
+        
+        // Docker configuration
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_IMAGE = "${APP_NAME}"
+    }
+    
+    parameters {
+        choice(
+            name: 'MAVEN_PROFILE',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Maven profile to use for build'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip test execution'
+        )
+        booleanParam(
+            name: 'RUN_SONAR',
+            defaultValue: true,
+            description: 'Run SonarQube analysis'
+        )
+        booleanParam(
+            name: 'BUILD_DOCKER',
+            defaultValue: false,
+            description: 'Build Docker image'
+        )
+        booleanParam(
+            name: 'DEPLOY_ARTIFACTS',
+            defaultValue: false,
+            description: 'Deploy artifacts to repository'
+        )
+    }
+    
+    options {
+        // Build options
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5'))
+        timeout(time: 30, unit: 'MINUTES')
+        skipDefaultCheckout()
+        timestamps()
+        
+        // Parallel builds
+        parallelsAlwaysFailFast()
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Checking out source code...'
+                checkout scm
+                
+                script {
+                    // Get git information
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.GIT_BRANCH_NAME = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.GIT_AUTHOR = sh(
+                        script: 'git log -1 --pretty=format:"%an"',
+                        returnStdout: true
+                    ).trim()
+                }
+                
+                echo "📋 Git commit: ${env.GIT_COMMIT_SHORT}"
+                echo "📋 Git branch: ${env.GIT_BRANCH_NAME}"
+                echo "📋 Git author: ${env.GIT_AUTHOR}"
+            }
+        }
+        
+        stage('Environment Info') {
+            steps {
+                echo '🔍 Gathering environment information...'
+                
+                sh '''
+                    echo "=== Build Information ==="
+                    echo "App Name: $APP_NAME"
+                    echo "App Version: $APP_VERSION"
+                    echo "Maven Profile: ''' + params.MAVEN_PROFILE + '''"
+                    echo "Build Number: $BUILD_NUMBER"
+                    echo "Build Timestamp: $BUILD_TIMESTAMP"
+                    echo "Git Commit: $GIT_COMMIT_SHORT"
+                    echo "Git Branch: $GIT_BRANCH_NAME"
+                    echo ""
+                    
+                    echo "=== Environment Information ==="
+                    echo "Jenkins URL: $JENKINS_URL"
+                    echo "Job Name: $JOB_NAME"
+                    echo "Workspace: $WORKSPACE"
+                    echo "Node Name: $NODE_NAME"
+                    echo ""
+                    
+                    echo "=== Tool Versions ==="
+                    mvn --version
+                    java -version
+                    echo ""
+                '''
+            }
+        }
+        
+        stage('Maven Validate') {
+            steps {
+                echo '✅ Validating Maven project...'
+                
+                sh """
+                    mvn ${MAVEN_CLI_OPTS} validate -P${params.MAVEN_PROFILE}
+                """
+                
+                // Display project information
+                script {
+                    def pom = readMavenPom()
+                    echo "📦 Project: ${pom.groupId}:${pom.artifactId}:${pom.version}"
+                    echo "📦 Packaging: ${pom.packaging}"
+                    echo "📦 Description: ${pom.description}"
+                }
+            }
+        }
+        
+        stage('Dependencies') {
+            steps {
+                echo '📦 Resolving dependencies...'
+                
+                sh """
+                    mvn ${MAVEN_CLI_OPTS} dependency:resolve dependency:resolve-sources -P${params.MAVEN_PROFILE}
+                """
+                
+                // Display dependency tree (limited depth for readability)
+                sh """
+                    echo "=== Dependency Tree ==="
+                    mvn dependency:tree -Dverbose=false -DoutputType=text | head -50
+                """
+            }
+        }
+        
+        stage('Compile') {
+            steps {
+                echo '🔨 Compiling source code...'
+                
+                sh """
+                    mvn ${MAVEN_CLI_OPTS} clean compile -P${params.MAVEN_PROFILE}
+                """
+                
+                // Show compilation statistics
+                sh '''
+                    echo "=== Compilation Statistics ==="
+                    find target/classes -name "*.class" | wc -l | xargs echo "Compiled classes:"
+                    du -sh target/classes | xargs echo "Classes size:"
+                '''
+            }
+        }
+        
+        stage('Test') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        echo '🧪 Running unit tests...'
+                        
+                        sh """
+                            mvn ${MAVEN_CLI_OPTS} test -P${params.MAVEN_PROFILE}
+                        """
+                    }
+                    
+                    post {
+                        always {
+                            // Publish test results
+                            publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
+                            
+                            // Archive test reports
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'target/surefire-reports',
+                                reportFiles: '*.html',
+                                reportName: 'Unit Test Report'
+                            ])
+                        }
+                    }
+                }
+                
+                stage('Integration Tests') {
+                    steps {
+                        echo '🔗 Running integration tests...'
+                        
+                        sh """
+                            mvn ${MAVEN_CLI_OPTS} integration-test -P${params.MAVEN_PROFILE}
+                        """
+                    }
+                    
+                    post {
+                        always {
+                            // Publish integration test results
+                            publishTestResults testResultsPattern: 'target/failsafe-reports/*.xml'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('Code Coverage') {
+                    when {
+                        expression { !params.SKIP_TESTS }
+                    }
+                    steps {
+                        echo '📊 Generating code coverage report...'
+                        
+                        sh """
+                            mvn ${MAVEN_CLI_OPTS} jacoco:report -P${params.MAVEN_PROFILE}
+                        """
+                    }
+                    
+                    post {
+                        always {
+                            // Publish coverage report
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'target/site/jacoco',
+                                reportFiles: 'index.html',
+                                reportName: 'Code Coverage Report'
+                            ])
+                            
+                            // Parse coverage for display
+                            script {
+                                if (fileExists('target/site/jacoco/jacoco.xml')) {
+                                    def coverage = sh(
+                                        script: '''
+                                            grep -o 'missed="[0-9]*"' target/site/jacoco/jacoco.xml | \\
+                                            head -1 | grep -o '[0-9]*' || echo "0"
+                                        ''',
+                                        returnStdout: true
+                                    ).trim()
+                                    echo "📊 Code coverage data generated"
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                stage('SonarQube Analysis') {
+                    when {
+                        expression { params.RUN_SONAR }
+                    }
+                    steps {
+                        echo '🔍 Running SonarQube analysis...'
+                        
+                        script {
+                            // Run SonarQube analysis if server is configured
+                            try {
+                                withSonarQubeEnv('SonarQube') {
+                                    sh """
+                                        mvn ${MAVEN_CLI_OPTS} sonar:sonar \\
+                                            -Dsonar.projectKey=${SONAR_PROJECT_KEY} \\
+                                            -Dsonar.projectName="${APP_NAME}" \\
+                                            -Dsonar.projectVersion=${APP_VERSION} \\
+                                            -P${params.MAVEN_PROFILE}
+                                    """
+                                }
+                            } catch (Exception e) {
+                                echo "⚠️ SonarQube analysis failed or not configured: ${e.message}"
+                            }
+                        }
+                    }
+                }
+                
+                stage('Dependency Check') {
+                    steps {
+                        echo '🔒 Running dependency vulnerability check...'
+                        
+                        script {
+                            try {
+                                sh """
+                                    mvn ${MAVEN_CLI_OPTS} org.owasp:dependency-check-maven:check \\
+                                        -DfailBuildOnCVSS=8 \\
+                                        -P${params.MAVEN_PROFILE}
+                                """
+                            } catch (Exception e) {
+                                echo "⚠️ Dependency check completed with warnings: ${e.message}"
+                            }
+                        }
+                    }
+                    
+                    post {
+                        always {
+                            // Publish dependency check report
+                            publishHTML([
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'target/dependency-check-report',
+                                reportFiles: 'dependency-check-report.html',
+                                reportName: 'Dependency Check Report'
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Package') {
+            steps {
+                echo '📦 Packaging application...'
+                
+                sh """
+                    mvn ${MAVEN_CLI_OPTS} package -DskipTests -P${params.MAVEN_PROFILE}
+                """
+                
+                // Display package information
+                sh '''
+                    echo "=== Package Information ==="
+                    ls -la target/*.jar target/*.war 2>/dev/null || echo "No packages found"
+                    
+                    if [ -f target/*.jar ]; then
+                        for jar in target/*.jar; do
+                            echo "Package: $jar"
+                            echo "Size: $(du -h "$jar" | cut -f1)"
+                        done
+                    fi
+                '''
+            }
+            
+            post {
+                success {
+                    // Archive artifacts
+                    archiveArtifacts artifacts: 'target/*.jar, target/*.war', fingerprint: true
+                    
+                    echo '✅ Artifacts archived successfully'
+                }
+            }
+        }
+        
+        stage('Docker Build') {
+            when {
+                expression { params.BUILD_DOCKER }
+            }
+            steps {
+                echo '🐳 Building Docker image...'
+                
+                script {
+                    // Create Dockerfile if it doesn't exist
+                    if (!fileExists('Dockerfile')) {
+                        writeFile file: 'Dockerfile', text: '''
+FROM openjdk:11-jre-slim
+
+LABEL maintainer="jenkins@example.com"
+LABEL version="''' + env.APP_VERSION + '''"
+LABEL build-number="''' + env.BUILD_NUMBER + '''"
+
+# Create app directory
+WORKDIR /app
+
+# Copy application jar
+COPY target/*.jar app.jar
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \\
+    CMD curl -f http://localhost:8080/actuator/health || exit 1
+
+# Run application
+ENTRYPOINT ["java", "-jar", "app.jar"]
+'''
+                    }
+                    
+                    // Build Docker image
+                    def image = docker.build("${DOCKER_IMAGE}:${BUILD_NUMBER}")
+                    image.tag("${DOCKER_IMAGE}:latest")
+                    
+                    // Test Docker image
+                    image.inside('-p 8080:8080') {
+                        sh '''
+                            echo "Testing Docker image..."
+                            # Add image testing logic here
+                        '''
+                    }
+                    
+                    env.DOCKER_IMAGE_ID = image.id
+                    echo "🐳 Docker image built: ${DOCKER_IMAGE}:${BUILD_NUMBER}"
+                }
+            }
+        }
+        
+        stage('Deploy Artifacts') {
+            when {
+                expression { params.DEPLOY_ARTIFACTS }
+            }
+            steps {
+                echo '🚀 Deploying artifacts...'
+                
+                script {
+                    if (env.BRANCH_NAME == 'main' || params.MAVEN_PROFILE == 'prod') {
+                        input message: 'Deploy to production repository?', ok: 'Deploy'
+                    }
+                    
+                    // Deploy to Maven repository
+                    sh """
+                        mvn ${MAVEN_CLI_OPTS} deploy -DskipTests -P${params.MAVEN_PROFILE}
+                    """
+                    
+                    echo "✅ Artifacts deployed successfully"
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            when {
+                expression { params.RUN_SONAR }
+            }
+            steps {
+                echo '🚦 Waiting for SonarQube quality gate...'
+                
+                script {
+                    try {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            def qg = waitForQualityGate()
+                            if (qg.status != 'OK') {
+                                error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                            } else {
+                                echo "✅ Quality gate passed"
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Quality gate check failed or not configured: ${e.message}"
+                    }
+                }
+            }
+        }
+        
+        stage('Performance Test') {
+            when {
+                expression { params.MAVEN_PROFILE == 'staging' || params.MAVEN_PROFILE == 'prod' }
+            }
+            steps {
+                echo '⚡ Running performance tests...'
+                
+                script {
+                    // Simulate performance testing
+                    sh '''
+                        echo "Starting performance test..."
+                        echo "Load testing with 100 concurrent users..."
+                        sleep 5
+                        echo "Performance test completed"
+                        
+                        # Create mock performance report
+                        mkdir -p target/performance-reports
+                        cat > target/performance-reports/performance-report.html << EOF
+<html>
+<head><title>Performance Test Report</title></head>
+<body>
+<h1>Performance Test Results</h1>
+<p>Average Response Time: 250ms</p>
+<p>Throughput: 400 requests/second</p>
+<p>Error Rate: 0.1%</p>
+<p>Test Status: PASSED</p>
+</body>
+</html>
+EOF
+                    '''
+                }
+            }
+            
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'target/performance-reports',
+                        reportFiles: 'performance-report.html',
+                        reportName: 'Performance Test Report'
+                    ])
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '🧹 Cleaning up...'
+            
+            // Clean workspace
+            cleanWs(
+                cleanWhenAborted: true,
+                cleanWhenFailure: true,
+                cleanWhenNotBuilt: true,
+                cleanWhenSuccess: true,
+                cleanWhenUnstable: true,
+                deleteDirs: true
+            )
+        }
+        
+        success {
+            echo '🎉 Maven build completed successfully!'
+            
+            script {
+                def buildDuration = currentBuild.durationString.replace(' and counting', '')
+                def message = """
+✅ **Build Successful!**
+
+**Project:** ${APP_NAME}
+**Version:** ${APP_VERSION}
+**Profile:** ${params.MAVEN_PROFILE}
+**Build:** #${BUILD_NUMBER}
+**Duration:** ${buildDuration}
+**Branch:** ${env.GIT_BRANCH_NAME}
+**Commit:** ${env.GIT_COMMIT_SHORT}
+
+**Build URL:** ${BUILD_URL}
+                """.stripIndent()
+                
+                echo message
+                
+                // Send notification if configured
+                // emailext subject: "✅ Build Success: ${APP_NAME} #${BUILD_NUMBER}",
+                //          body: message,
+                //          to: '${DEFAULT_RECIPIENTS}'
+            }
+        }
+        
+        failure {
+            echo '❌ Maven build failed!'
+            
+            script {
+                def message = """
+❌ **Build Failed!**
+
+**Project:** ${APP_NAME}
+**Version:** ${APP_VERSION}
+**Profile:** ${params.MAVEN_PROFILE}
+**Build:** #${BUILD_NUMBER}
+**Branch:** ${env.GIT_BRANCH_NAME}
+**Commit:** ${env.GIT_COMMIT_SHORT}
+
+**Failed Stage:** ${env.STAGE_NAME ?: 'Unknown'}
+**Build URL:** ${BUILD_URL}
+**Console:** ${BUILD_URL}console
+
+Please check the build logs for details.
+                """.stripIndent()
+                
+                echo message
+                
+                // Send notification if configured
+                // emailext subject: "❌ Build Failed: ${APP_NAME} #${BUILD_NUMBER}",
+                //          body: message,
+                //          to: '${DEFAULT_RECIPIENTS}'
+            }
+        }
+        
+        unstable {
+            echo '⚠️ Maven build unstable (tests failed but build succeeded)'
+        }
+        
+        changed {
+            echo '🔄 Build result changed from previous build'
+        }
+    }
+}

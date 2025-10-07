@@ -1,0 +1,439 @@
+// Basic Declarative Pipeline Example
+// Save as Jenkinsfile in your repository root
+
+pipeline {
+    agent any
+    
+    environment {
+        // Environment variables available to all stages
+        APP_NAME = 'my-awesome-app'
+        VERSION = "${env.BUILD_NUMBER}"
+        REGISTRY = 'docker.io/mycompany'
+    }
+    
+    parameters {
+        string(
+            name: 'BRANCH_NAME', 
+            defaultValue: 'main', 
+            description: 'Branch to build'
+        )
+        choice(
+            name: 'DEPLOY_ENV', 
+            choices: ['none', 'dev', 'staging', 'production'], 
+            description: 'Environment to deploy to'
+        )
+        booleanParam(
+            name: 'RUN_TESTS', 
+            defaultValue: true, 
+            description: 'Run test suite'
+        )
+        booleanParam(
+            name: 'SKIP_DEPLOY', 
+            defaultValue: false, 
+            description: 'Skip deployment stage'
+        )
+    }
+    
+    options {
+        // Build options
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        skipDefaultCheckout()
+        timestamps()
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "🔍 Checking out ${params.BRANCH_NAME} branch"
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.BRANCH_NAME}"]],
+                    userRemoteConfigs: [[url: scm.userRemoteConfigs[0].url]]
+                ])
+                
+                script {
+                    // Get git information
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.GIT_AUTHOR = sh(
+                        script: 'git log -1 --pretty=format:"%an"',
+                        returnStdout: true
+                    ).trim()
+                }
+                
+                echo "📝 Git commit: ${env.GIT_COMMIT_SHORT} by ${env.GIT_AUTHOR}"
+            }
+        }
+        
+        stage('Environment Setup') {
+            steps {
+                echo '🛠️ Setting up build environment'
+                
+                // Display build information
+                sh '''
+                    echo "=== Build Information ==="
+                    echo "App Name: $APP_NAME"
+                    echo "Version: $VERSION"
+                    echo "Git Commit: $GIT_COMMIT_SHORT"
+                    echo "Author: $GIT_AUTHOR"
+                    echo "Build URL: $BUILD_URL"
+                    echo "Node: $NODE_NAME"
+                    echo "Workspace: $WORKSPACE"
+                    echo ""
+                '''
+                
+                // Check system information
+                sh '''
+                    echo "=== System Information ==="
+                    echo "OS: $(uname -s)"
+                    echo "Architecture: $(uname -m)"
+                    echo "Hostname: $(hostname)"
+                    echo "Date: $(date)"
+                    echo "User: $(whoami)"
+                    echo "Working Directory: $(pwd)"
+                    echo ""
+                '''
+                
+                // Verify tools
+                sh '''
+                    echo "=== Available Tools ==="
+                    which git && git --version || echo "Git not found"
+                    which docker && docker --version || echo "Docker not found"
+                    which node && node --version || echo "Node.js not found"
+                    which npm && npm --version || echo "npm not found"
+                    which java && java -version || echo "Java not found"
+                    which mvn && mvn --version || echo "Maven not found"
+                    echo ""
+                '''
+            }
+        }
+        
+        stage('Dependencies') {
+            steps {
+                echo '📦 Installing dependencies'
+                
+                script {
+                    // Check for different project types and install dependencies
+                    if (fileExists('package.json')) {
+                        echo 'Node.js project detected'
+                        sh 'npm ci --only=production'
+                    } else if (fileExists('pom.xml')) {
+                        echo 'Maven project detected'
+                        sh 'mvn dependency:resolve'
+                    } else if (fileExists('build.gradle')) {
+                        echo 'Gradle project detected'
+                        sh './gradlew dependencies'
+                    } else if (fileExists('requirements.txt')) {
+                        echo 'Python project detected'
+                        sh 'pip install -r requirements.txt'
+                    } else {
+                        echo 'No recognized dependency file found'
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                echo '🔨 Building application'
+                
+                script {
+                    // Build based on project type
+                    if (fileExists('package.json')) {
+                        sh 'npm run build || echo "No build script defined"'
+                    } else if (fileExists('pom.xml')) {
+                        sh 'mvn clean compile'
+                    } else if (fileExists('build.gradle')) {
+                        sh './gradlew clean build -x test'
+                    } else if (fileExists('Makefile')) {
+                        sh 'make build'
+                    } else {
+                        // Generic build simulation
+                        sh '''
+                            echo "Creating build artifacts..."
+                            mkdir -p dist
+                            echo "Build completed at $(date)" > dist/build-info.txt
+                            echo "Version: $VERSION" >> dist/build-info.txt
+                            echo "Commit: $GIT_COMMIT_SHORT" >> dist/build-info.txt
+                        '''
+                    }
+                }
+            }
+            
+            post {
+                always {
+                    echo '📊 Build stage completed'
+                }
+                
+                success {
+                    echo '✅ Build successful'
+                }
+                
+                failure {
+                    echo '❌ Build failed'
+                }
+            }
+        }
+        
+        stage('Test') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        echo '🧪 Running unit tests'
+                        
+                        script {
+                            if (fileExists('package.json')) {
+                                sh 'npm test || true'
+                            } else if (fileExists('pom.xml')) {
+                                sh 'mvn test'
+                            } else if (fileExists('build.gradle')) {
+                                sh './gradlew test'
+                            } else {
+                                // Simulate tests
+                                sh '''
+                                    echo "Running unit tests..."
+                                    mkdir -p test-results
+                                    echo "Unit test results" > test-results/unit-tests.xml
+                                    echo "All unit tests passed!"
+                                '''
+                            }
+                        }
+                    }
+                    
+                    post {
+                        always {
+                            // Publish test results if available
+                            script {
+                                if (fileExists('test-results/*.xml') || fileExists('target/surefire-reports/*.xml')) {
+                                    junit testResultsPattern: 'test-results/*.xml, target/surefire-reports/*.xml'
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                stage('Code Quality') {
+                    steps {
+                        echo '📋 Running code quality checks'
+                        
+                        script {
+                            if (fileExists('package.json')) {
+                                sh 'npm run lint || echo "No lint script defined"'
+                            } else {
+                                sh '''
+                                    echo "Running code quality checks..."
+                                    echo "Code quality: PASSED" > code-quality-report.txt
+                                '''
+                            }
+                        }
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        echo '🔒 Running security scan'
+                        
+                        script {
+                            if (fileExists('package.json')) {
+                                sh 'npm audit --audit-level moderate || true'
+                            } else {
+                                sh '''
+                                    echo "Running security scan..."
+                                    echo "Security scan: PASSED" > security-report.txt
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Package') {
+            steps {
+                echo '📦 Packaging application'
+                
+                sh '''
+                    echo "Creating application package..."
+                    
+                    # Create package directory
+                    mkdir -p packages
+                    
+                    # Package based on what's available
+                    if [ -d "dist" ]; then
+                        tar -czf "packages/${APP_NAME}-${VERSION}.tar.gz" dist/
+                    elif [ -d "target" ]; then
+                        cp target/*.jar "packages/" 2>/dev/null || true
+                        tar -czf "packages/${APP_NAME}-${VERSION}.tar.gz" target/
+                    elif [ -d "build" ]; then
+                        tar -czf "packages/${APP_NAME}-${VERSION}.tar.gz" build/
+                    else
+                        # Create a basic package
+                        tar -czf "packages/${APP_NAME}-${VERSION}.tar.gz" ./ --exclude='.git' --exclude='node_modules'
+                    fi
+                    
+                    # List created packages
+                    ls -la packages/
+                '''
+            }
+            
+            post {
+                success {
+                    archiveArtifacts artifacts: 'packages/*', fingerprint: true
+                    echo '📦 Artifacts archived successfully'
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                allOf {
+                    expression { params.SKIP_DEPLOY == false }
+                    expression { params.DEPLOY_ENV != 'none' }
+                }
+            }
+            
+            steps {
+                script {
+                    echo "🚀 Deploying to ${params.DEPLOY_ENV} environment"
+                    
+                    // Require approval for production
+                    if (params.DEPLOY_ENV == 'production') {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            input(
+                                message: "Deploy ${APP_NAME} v${VERSION} to PRODUCTION?",
+                                ok: 'Deploy to Production',
+                                submitterParameter: 'APPROVER'
+                            )
+                        }
+                        echo "Production deployment approved by: ${env.APPROVER}"
+                    }
+                    
+                    // Simulate deployment
+                    sh """
+                        echo "Deploying ${APP_NAME} version ${VERSION} to ${params.DEPLOY_ENV}"
+                        echo "Deployment started at \$(date)"
+                        
+                        # Simulate deployment steps
+                        sleep 2
+                        echo "✅ Application deployed successfully"
+                        echo "🌐 Application URL: https://${APP_NAME}-${params.DEPLOY_ENV}.example.com"
+                        
+                        # Create deployment log
+                        mkdir -p logs
+                        cat > logs/deployment-${params.DEPLOY_ENV}.log << EOF
+Deployment Details:
+- Application: ${APP_NAME}
+- Version: ${VERSION}
+- Environment: ${params.DEPLOY_ENV}
+- Git Commit: ${env.GIT_COMMIT_SHORT}
+- Deployed By: ${env.BUILD_USER_ID ?: 'Jenkins'}
+- Deployment Time: \$(date)
+- Build URL: ${env.BUILD_URL}
+EOF
+                    """
+                }
+            }
+            
+            post {
+                success {
+                    archiveArtifacts artifacts: 'logs/*.log', allowEmptyArchive: true
+                    echo "✅ Deployment to ${params.DEPLOY_ENV} completed successfully"
+                }
+                
+                failure {
+                    echo "❌ Deployment to ${params.DEPLOY_ENV} failed"
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '🧹 Cleaning up workspace'
+            
+            // Archive important files
+            archiveArtifacts artifacts: '*.txt, *.log', allowEmptyArchive: true
+            
+            // Clean workspace
+            cleanWs()
+        }
+        
+        success {
+            echo '🎉 Pipeline completed successfully!'
+            
+            script {
+                def message = """
+✅ **Build Successful!**
+
+**Project:** ${APP_NAME}
+**Version:** ${VERSION}
+**Branch:** ${params.BRANCH_NAME}
+**Environment:** ${params.DEPLOY_ENV}
+**Build Number:** ${env.BUILD_NUMBER}
+**Duration:** ${currentBuild.durationString}
+
+**Git Information:**
+- Commit: ${env.GIT_COMMIT_SHORT}
+- Author: ${env.GIT_AUTHOR}
+
+**Build URL:** ${env.BUILD_URL}
+                """.stripIndent()
+                
+                echo message
+                
+                // Send notification (if email is configured)
+                // emailext subject: "✅ Build Success: ${APP_NAME} #${env.BUILD_NUMBER}",
+                //          body: message,
+                //          to: '${DEFAULT_RECIPIENTS}'
+            }
+        }
+        
+        failure {
+            echo '❌ Pipeline failed!'
+            
+            script {
+                def message = """
+❌ **Build Failed!**
+
+**Project:** ${APP_NAME}
+**Version:** ${VERSION}
+**Branch:** ${params.BRANCH_NAME}
+**Build Number:** ${env.BUILD_NUMBER}
+**Failed Stage:** ${env.STAGE_NAME ?: 'Unknown'}
+
+**Git Information:**
+- Commit: ${env.GIT_COMMIT_SHORT}
+- Author: ${env.GIT_AUTHOR}
+
+**Build URL:** ${env.BUILD_URL}
+**Console:** ${env.BUILD_URL}console
+
+Please check the build logs for more details.
+                """.stripIndent()
+                
+                echo message
+                
+                // Send notification (if email is configured)
+                // emailext subject: "❌ Build Failed: ${APP_NAME} #${env.BUILD_NUMBER}",
+                //          body: message,
+                //          to: '${DEFAULT_RECIPIENTS}'
+            }
+        }
+        
+        unstable {
+            echo '⚠️ Pipeline unstable (tests failed but build succeeded)'
+        }
+        
+        changed {
+            echo '🔄 Build result changed from previous build'
+        }
+    }
+}

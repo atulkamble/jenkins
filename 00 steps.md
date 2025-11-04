@@ -41,14 +41,34 @@ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 
 // Install suggested Plugins 
 
-// add username, password, Name, Email 
+// add username, password, Name, Email
+
+settings >> plugins >> available plugins >> blue ocean, docker, docker pipeline etc.
+
+settings >> Tools >> git, myMaven, myJDK, myDocker | install automatically
+
+pipeline { 
+     agent any 
+  
+     stages { 
+         stage('Dev') { 
+             steps { 
+                 echo 'I am in dev' 
+                 sh 'git --version' 
+             } 
+         } 
+         stage('Test') { 
+             steps { 
+                 echo 'I am in test' 
+                 sh 'docker --version' 
+             } 
+         } 
+         stage('Prod') { 
+             steps { 
+                 echo 'Application Deployed' 
+             } 
+         } 
+     } 
+ }
 
 ```
-
-
-
-
-
-
-
-
